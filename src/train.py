@@ -2,19 +2,15 @@
 Пайплайн обучения гибридного классификатора ЭКГ — [ML-03]
 =========================================================
 Ветка: feature/ml-model
-
-Особенности реализации:
-1. Пациентонезависимый сплит (GroupKFold) внутри DS1 — предотвращает утечку данных.
-2. Сглаженный Focal Loss с весами эффективного числа сэмплов (Cui et al.).
-3. Оптимизатор AdamW + CosineAnnealingLR.
-4. Отслеживание Macro-F1 на валидации и сохранение лучшего чекпоинта.
-5. Поддержка режима `--smoke-test` для проверки пайплайна на синтетических данных.
 """
 
 import argparse
+import os
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -31,6 +27,9 @@ import yaml
 from src.contracts import NUM_CLASSES, validate_batch
 from src.losses.focal_loss import FocalLoss, compute_effective_num_weights
 from src.models.hybrid_cnn import HybridECGClassifier
+
+MAX_NPZ_ARCHIVE_BYTES = 512 * 1024 * 1024           # 512 МБ лимит на сжатый архив
+MAX_NPZ_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024  # 2 ГБ лимит на распакованные массивы
 
 
 class InMemoryECGDataset(Dataset):
@@ -65,23 +64,58 @@ def generate_synthetic_ds1(
 
     signals = rng.normal(0.0, 1.0, size=(total, 1, 256)).astype(np.float32)
     rr_features = rng.uniform(0.5, 1.5, size=(total, 4)).astype(np.float32)
-    # Имитация дисбаланса AAMI: ~85% N (0), ~5% S (1), ~8% V (2), ~2% F (3)
     labels = rng.choice([0, 1, 2, 3], size=total, p=[0.85, 0.05, 0.08, 0.02]).astype(np.int64)
     patient_ids = np.repeat(np.arange(100, 100 + num_patients), samples_per_patient)
 
     return signals, rr_features, labels, patient_ids
 
 
-def load_ds1_arrays(processed_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Загружает подготовленный напарником файл ds1_train.npz."""
-    npz_path = processed_dir / "ds1_train.npz"
+def load_npz_safely(npz_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Безопасно проверяет размер архива и загружает массивы по контракту src/contracts.py."""
     if not npz_path.exists():
         raise FileNotFoundError(
             f"Файл '{npz_path}' не найден! Дождитесь завершения [DATA-03] или запустите с флагом --smoke-test."
         )
 
-    data = np.load(npz_path)
-    return data["signals"], data["rr_features"], data["labels"], data["patient_ids"]
+    if npz_path.stat().st_size > MAX_NPZ_ARCHIVE_BYTES:
+        raise ValueError(f"Файл '{npz_path}' превышает допустимый лимит размера архива.")
+
+    with zipfile.ZipFile(npz_path, "r") as zf:
+        total_uncompressed = sum(info.file_size for info in zf.infolist())
+        if total_uncompressed > MAX_NPZ_UNCOMPRESSED_BYTES:
+            raise ValueError(
+                f"Распакованный размер '{npz_path}' ({total_uncompressed} байт) превышает лимит памяти."
+            )
+
+    with np.load(npz_path, allow_pickle=False) as data:
+        if "rr" not in data.files:
+            raise KeyError(f"В архиве '{npz_path}' отсутствует обязательный ключ 'rr'. Найдены: {data.files}")
+        return data["signals"], data["rr"], data["labels"], data["patient_ids"]
+
+
+def resolve_dataset_path(data_cfg: Dict, file_key: str, default_filename: str) -> Path:
+    """Определяет путь к файлу датасета из конфигурации."""
+    processed_dir = Path(data_cfg.get("processed_dir", "data/processed"))
+    configured_file = data_cfg.get(file_key)
+    if configured_file:
+        cfg_path = Path(configured_file)
+        return cfg_path if cfg_path.is_absolute() or cfg_path.parent != Path(".") else processed_dir / cfg_path
+    return processed_dir / default_filename
+
+
+def save_checkpoint_atomic(payload: Dict, target_path: Path) -> None:
+    """Атомарно сохраняет чекпоинт через временный файл (защита от обрыва записи)."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(target_path.parent), prefix=f".{target_path.stem}_", suffix=".tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, target_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
 
 
 def evaluate_epoch(
@@ -90,7 +124,7 @@ def evaluate_epoch(
     criterion: nn.Module,
     device: torch.device,
 ) -> Tuple[float, float]:
-    """Оценка модели на валидационной выборке (loss и Macro-F1)."""
+    """Оценка модели на валидационной выборке (loss и Macro-F1 по всем 4 классам)."""
     model.eval()
     total_loss = 0.0
     all_preds = []
@@ -114,19 +148,22 @@ def evaluate_epoch(
     avg_loss = total_loss / len(loader.dataset)
     y_true = np.concatenate(all_targets)
     y_pred = np.concatenate(all_preds)
-    macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    macro_f1 = float(
+        f1_score(y_true, y_pred, labels=list(range(NUM_CLASSES)), average="macro", zero_division=0)
+    )
     return avg_loss, macro_f1
 
 
-def train(config_path: str, smoke_test: bool = False) -> None:
+def train(config_path: str, smoke_test: bool = False, run_id: Optional[str] = None) -> Path:
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
+    project_cfg = cfg.get("project", {})
     data_cfg = cfg.get("data", {})
     model_cfg = cfg.get("model", {})
     train_cfg = cfg.get("training", cfg.get("train", {}))
 
-    seed = int(train_cfg.get("seed", cfg.get("seed", 42)))
+    seed = int(train_cfg.get("seed", project_cfg.get("seed", cfg.get("seed", 42))))
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -138,14 +175,24 @@ def train(config_path: str, smoke_test: bool = False) -> None:
         print("[INFO] Запуск в режиме --smoke-test на синтетических данных...")
         signals, rr_features, labels, patient_ids = generate_synthetic_ds1(seed=seed)
     else:
-        processed_dir = Path(data_cfg.get("processed_dir", "data/processed"))
-        signals, rr_features, labels, patient_ids = load_ds1_arrays(processed_dir)
+        train_npz_path = resolve_dataset_path(data_cfg, "train_file", "ds1_train.npz")
+        signals, rr_features, labels, patient_ids = load_npz_safely(train_npz_path)
 
-    # 2. Пациентонезависимый сплит (GroupKFold, 5 фолдов -> 80% пациентов train / 20% val)
+    # 2. Пациентонезависимый сплит (GroupKFold) с выбором фолда с максимальным числом классов в train
     n_splits = int(train_cfg.get("n_folds", 5))
     gkf = GroupKFold(n_splits=n_splits)
-    train_idx, val_idx = next(gkf.split(signals, labels, groups=patient_ids))
+    best_split = None
+    best_unique_classes = -1
 
+    for tr_idx, va_idx in gkf.split(signals, labels, groups=patient_ids):
+        unique_cnt = len(np.unique(labels[tr_idx]))
+        if unique_cnt > best_unique_classes:
+            best_unique_classes = unique_cnt
+            best_split = (tr_idx, va_idx)
+        if unique_cnt == NUM_CLASSES:
+            break
+
+    train_idx, val_idx = best_split
     train_patients = set(patient_ids[train_idx])
     val_patients = set(patient_ids[val_idx])
     assert len(train_patients.intersection(val_patients)) == 0, "Обнаружена утечка пациентов между train и val!"
@@ -157,7 +204,9 @@ def train(config_path: str, smoke_test: bool = False) -> None:
     # 3. Расчёт сглаженных весов Focal Loss строго по обучающей части
     train_labels = labels[train_idx]
     class_counts = [int(np.sum(train_labels == c)) for c in range(NUM_CLASSES)]
-    beta = float(train_cfg.get("focal_beta", train_cfg.get("beta", 0.999)))
+    beta = float(
+        train_cfg.get("effective_samples_beta", train_cfg.get("focal_beta", train_cfg.get("beta", 0.999)))
+    )
     gamma = float(train_cfg.get("focal_gamma", train_cfg.get("gamma", 2.0)))
 
     alpha_weights = compute_effective_num_weights(class_counts, beta=beta).to(device)
@@ -172,11 +221,15 @@ def train(config_path: str, smoke_test: bool = False) -> None:
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     # 5. Инициализация модели и оптимизатора
+    cnn_embed_dim = int(model_cfg.get("cnn_embed_dim", 128))
+    rr_embed_dim = int(model_cfg.get("rr_embed_dim", 32))
+    dropout = float(model_cfg.get("dropout", 0.3))
+
     model = HybridECGClassifier(
-        cnn_embed_dim=int(model_cfg.get("cnn_embed_dim", 128)),
-        rr_embed_dim=int(model_cfg.get("rr_embed_dim", 32)),
+        cnn_embed_dim=cnn_embed_dim,
+        rr_embed_dim=rr_embed_dim,
         num_classes=NUM_CLASSES,
-        dropout=float(model_cfg.get("dropout", 0.3)),
+        dropout=dropout,
     ).to(device)
 
     lr = float(train_cfg.get("learning_rate", train_cfg.get("lr", 1e-3)))
@@ -186,11 +239,11 @@ def train(config_path: str, smoke_test: bool = False) -> None:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # 6. Цикл обучения и сохранение лучшего чекпоинта
+    # 6. Изолированный путь чекпоинта на запуск + атомарное сохранение (совместимо с weights_only=True)
     ckpt_dir = Path(train_cfg.get("checkpoint_dir", "checkpoints"))
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_name = "smoke_best_model.pt" if smoke_test else "best_model.pt"
-    best_ckpt_path = ckpt_dir / ckpt_name
+    base_name = "smoke_best_model.pt" if smoke_test else "best_model.pt"
+    best_ckpt_path = ckpt_dir / (f"{run_id}_{base_name}" if run_id else base_name)
 
     best_val_f1 = -1.0
 
@@ -224,27 +277,34 @@ def train(config_path: str, smoke_test: bool = False) -> None:
 
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            torch.save(
+            save_checkpoint_atomic(
                 {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "val_macro_f1": best_val_f1,
-                    "config": cfg,
+                    "epoch": int(epoch),
+                    "model_state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+                    "val_macro_f1": float(best_val_f1),
+                    "model_params": {
+                        "cnn_embed_dim": cnn_embed_dim,
+                        "rr_embed_dim": rr_embed_dim,
+                        "num_classes": NUM_CLASSES,
+                        "dropout": dropout,
+                    },
                 },
                 best_ckpt_path,
             )
 
     print(f"\n[OK] Обучение завершено! Лучший Val Macro-F1: {best_val_f1:.4f}")
     print(f"[OK] Чекпоинт сохранён в: '{best_ckpt_path}'")
+    return best_ckpt_path
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Обучение гибридного классификатора ЭКГ")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Путь к файлу конфигурации")
+    parser.add_argument("--run-id", type=str, default=None, help="Идентификатор запуска для изоляции чекпоинтов")
     parser.add_argument(
         "--smoke-test",
         action="store_true",
         help="Запуск тестового обучения на 2 эпохи на синтетических данных",
     )
     args = parser.parse_args()
-    train(args.config, smoke_test=args.smoke_test)
+    train(args.config, smoke_test=args.smoke_test, run_id=args.run_id)

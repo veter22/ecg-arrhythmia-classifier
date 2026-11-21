@@ -2,26 +2,20 @@
 Независимая оценка модели на отложенной выборке DS2 — [ML-04]
 ==============================================================
 Ветка: feature/ml-model
-
-Задачи:
-1. Загрузить лучший чекпоинт HybridECGClassifier.
-2. Оценить качество на пациентонезависимом тесте DS2 (без утечки данных).
-3. Рассчитать Macro-F1, Precision, Recall, F1 и PR-AUC по каждому классу ('N', 'S', 'V', 'F').
-4. Построить и сохранить Confusion Matrix в `reports/figures/confusion_matrix.png`.
 """
 
 import argparse
 import json
+import os
 import sys
+import tempfile
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-import matplotlib
-matplotlib.use("Agg")  # Безголовый бэкенд для сохранения графиков без GUI
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -38,19 +32,34 @@ import yaml
 
 from src.contracts import IDX_TO_LABEL, NUM_CLASSES, validate_batch
 from src.models.hybrid_cnn import HybridECGClassifier
-from src.train import InMemoryECGDataset, generate_synthetic_ds1
+from src.train import (
+    InMemoryECGDataset,
+    generate_synthetic_ds1,
+    load_npz_safely,
+    resolve_dataset_path,
+)
 
 
-def load_ds2_arrays(processed_dir: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Загружает отложенный тестовый набор ds2_test.npz."""
-    npz_path = processed_dir / "ds2_test.npz"
-    if not npz_path.exists():
-        raise FileNotFoundError(
-            f"Файл '{npz_path}' не найден! Дождитесь завершения [DATA-03] или запустите с флагом --smoke-test."
-        )
+def load_model_from_checkpoint(
+    ckpt_file: Path,
+    model_cfg: Dict,
+    device: torch.device,
+) -> Tuple[HybridECGClassifier, Dict]:
+    """Безопасно загружает веса модели (weights_only=True) с учётом размерностей из чекпоинта."""
+    if not ckpt_file.exists():
+        raise FileNotFoundError(f"Чекпоинт '{ckpt_file}' не найден!")
 
-    data = np.load(npz_path)
-    return data["signals"], data["rr_features"], data["labels"], data["patient_ids"]
+    checkpoint = torch.load(ckpt_file, map_location=device, weights_only=True)
+    saved_params = checkpoint.get("model_params", {})
+
+    model = HybridECGClassifier(
+        cnn_embed_dim=int(saved_params.get("cnn_embed_dim", model_cfg.get("cnn_embed_dim", 128))),
+        rr_embed_dim=int(saved_params.get("rr_embed_dim", model_cfg.get("rr_embed_dim", 32))),
+        num_classes=int(saved_params.get("num_classes", NUM_CLASSES)),
+        dropout=float(saved_params.get("dropout", model_cfg.get("dropout", 0.3))),
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    return model, checkpoint
 
 
 def predict_on_loader(
@@ -86,18 +95,50 @@ def predict_on_loader(
     )
 
 
+def _save_figure_atomic(fig: plt.Figure, target_path: Path) -> None:
+    """Атомарно сохраняет изображение графика на диск."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(target_path.parent), prefix=f".{target_path.stem}_", suffix=".png")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        fig.savefig(tmp_path, format="png", bbox_inches="tight")
+        os.replace(tmp_path, target_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def _save_json_atomic(data: Dict, target_path: Path) -> None:
+    """Атомарно сохраняет JSON-отчёт на диск."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(target_path.parent), prefix=f".{target_path.stem}_", suffix=".json")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, target_path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
 def plot_confusion_matrix(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     save_path: Path,
 ) -> None:
-    """Строит и сохраняет двойную Confusion Matrix (абсолютные числа и нормировка по строкам)."""
-    save_path.parent.mkdir(parents=True, exist_ok=True)
+    """Строит и атомарно сохраняет двойную Confusion Matrix (абсолютные числа и Recall по строкам)."""
     class_names = [IDX_TO_LABEL[i] for i in range(NUM_CLASSES)]
 
     cm_abs = confusion_matrix(y_true, y_pred, labels=list(range(NUM_CLASSES)))
     row_sums = cm_abs.sum(axis=1, keepdims=True)
-    cm_norm = np.divide(cm_abs.astype(np.float64), row_sums, where=row_sums != 0) * 100.0
+    cm_norm = np.zeros_like(cm_abs, dtype=np.float64)
+    np.divide(cm_abs.astype(np.float64), row_sums, out=cm_norm, where=row_sums != 0)
+    cm_norm *= 100.0
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), dpi=150)
 
@@ -136,11 +177,16 @@ def plot_confusion_matrix(
                 )
 
     plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    _save_figure_atomic(fig, save_path)
     plt.close(fig)
 
 
-def evaluate(config_path: str, checkpoint_path: str = None, smoke_test: bool = False) -> Dict:
+def evaluate(
+    config_path: str,
+    checkpoint_path: Optional[str] = None,
+    smoke_test: bool = False,
+    run_id: Optional[str] = None,
+) -> Dict:
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
@@ -153,23 +199,11 @@ def evaluate(config_path: str, checkpoint_path: str = None, smoke_test: bool = F
 
     # 1. Загрузка чекпоинта
     ckpt_dir = Path(train_cfg.get("checkpoint_dir", "checkpoints"))
-    default_ckpt = ckpt_dir / ("smoke_best_model.pt" if smoke_test else "best_model.pt")
+    base_ckpt = "smoke_best_model.pt" if smoke_test else "best_model.pt"
+    default_ckpt = ckpt_dir / (f"{run_id}_{base_ckpt}" if run_id else base_ckpt)
     ckpt_file = Path(checkpoint_path) if checkpoint_path else default_ckpt
 
-    if not ckpt_file.exists():
-        raise FileNotFoundError(
-            f"Чекпоинт '{ckpt_file}' не найден! Сначала запустите `python -m src.train"
-            f"{' --smoke-test' if smoke_test else ''}`."
-        )
-
-    checkpoint = torch.load(ckpt_file, map_location=device, weights_only=False)
-    model = HybridECGClassifier(
-        cnn_embed_dim=int(model_cfg.get("cnn_embed_dim", 128)),
-        rr_embed_dim=int(model_cfg.get("rr_embed_dim", 32)),
-        num_classes=NUM_CLASSES,
-        dropout=float(model_cfg.get("dropout", 0.3)),
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model, checkpoint = load_model_from_checkpoint(ckpt_file, model_cfg, device)
     print(f"[OK] Загружен чекпоинт '{ckpt_file}' (эпоха {checkpoint.get('epoch', '?')})")
 
     # 2. Загрузка или генерация DS2
@@ -177,8 +211,8 @@ def evaluate(config_path: str, checkpoint_path: str = None, smoke_test: bool = F
         print("[INFO] Режим --smoke-test: генерация синтетического набора DS2...")
         signals, rr_features, labels, patient_ids = generate_synthetic_ds1(num_patients=6, samples_per_patient=80, seed=99)
     else:
-        processed_dir = Path(data_cfg.get("processed_dir", "data/processed"))
-        signals, rr_features, labels, patient_ids = load_ds2_arrays(processed_dir)
+        test_npz_path = resolve_dataset_path(data_cfg, "test_file", "ds2_test.npz")
+        signals, rr_features, labels, patient_ids = load_npz_safely(test_npz_path)
 
     test_dataset = InMemoryECGDataset(signals, rr_features, labels)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
@@ -186,20 +220,21 @@ def evaluate(config_path: str, checkpoint_path: str = None, smoke_test: bool = F
     # 3. Получение предсказаний
     y_true, y_pred, y_probs = predict_on_loader(model, test_loader, device)
 
-    # 4. Расчёт метрик
-    class_names = [IDX_TO_LABEL[i] for i in range(NUM_CLASSES)]
-    macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    # 4. Расчёт метрик по всем 4 классам
+    all_labels = list(range(NUM_CLASSES))
+    class_names = [IDX_TO_LABEL[i] for i in all_labels]
+    macro_f1 = float(f1_score(y_true, y_pred, labels=all_labels, average="macro", zero_division=0))
 
     report_dict = classification_report(
         y_true,
         y_pred,
-        labels=list(range(NUM_CLASSES)),
+        labels=all_labels,
         target_names=class_names,
         output_dict=True,
         zero_division=0,
     )
 
-    y_true_bin = label_binarize(y_true, classes=list(range(NUM_CLASSES)))
+    y_true_bin = label_binarize(y_true, classes=all_labels)
     pr_auc_per_class = {}
     for idx, cls_name in enumerate(class_names):
         if np.sum(y_true_bin[:, idx]) > 0:
@@ -207,7 +242,7 @@ def evaluate(config_path: str, checkpoint_path: str = None, smoke_test: bool = F
         else:
             pr_auc_per_class[cls_name] = 0.0
 
-    # Вывод красивой сводной таблицы в терминал
+    # Вывод сводной таблицы в терминал
     print(f"\n=== Итоговые метрики на {'Smoke-DS2' if smoke_test else 'Hold-out DS2'} ({len(np.unique(patient_ids))} пациентов, {len(y_true):,} ударов) ===")
     print(f"Главная метрика Macro-F1: {macro_f1:.4f}\n")
     print(f"{'Класс':<8} | {'Precision':>9} | {'Recall':>9} | {'F1-score':>9} | {'PR-AUC':>9} | {'Support':>9}")
@@ -219,16 +254,22 @@ def evaluate(config_path: str, checkpoint_path: str = None, smoke_test: bool = F
             f"{m['f1-score']:>9.4f} | {pr_auc_per_class[cls_name]:>9.4f} | {int(m['support']):>9,}"
         )
 
-    # 5. Сохранение графика Confusion Matrix и JSON с отчётом
-    fig_path = Path("reports/figures") / ("smoke_confusion_matrix.png" if smoke_test else "confusion_matrix.png")
-    plot_confusion_matrix(y_true, y_pred, fig_path)
-    print(f"\n[OK] Матрица ошибок сохранена в: '{fig_path}'")
+    # 5. Согласованная атомарная публикация отчётов
+    prefix = f"{run_id}_" if run_id else ""
+    fig_name = f"{prefix}{'smoke_confusion_matrix.png' if smoke_test else 'confusion_matrix.png'}"
+    json_name = f"{prefix}{'smoke_ds2_metrics.json' if smoke_test else 'ds2_metrics.json'}"
+
+    fig_path = Path("reports/figures") / fig_name
+    json_path = Path("reports") / json_name
 
     summary = {
+        "run_id": run_id or "default",
+        "checkpoint": str(ckpt_file),
         "split": "smoke_ds2" if smoke_test else "ds2_test",
         "num_patients": int(len(np.unique(patient_ids))),
         "num_beats": int(len(y_true)),
         "macro_f1": round(macro_f1, 4),
+        "confusion_matrix_figure": str(fig_path),
         "per_class": {
             cls_name: {
                 "precision": round(float(report_dict[cls_name]["precision"]), 4),
@@ -241,20 +282,22 @@ def evaluate(config_path: str, checkpoint_path: str = None, smoke_test: bool = F
         },
     }
 
-    json_path = Path("reports") / ("smoke_ds2_metrics.json" if smoke_test else "ds2_metrics.json")
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
-    print(f"[OK] JSON-отчёт сохранён в: '{json_path}'")
+    plot_confusion_matrix(y_true, y_pred, fig_path)
+    _save_json_atomic(summary, json_path)
 
+    print(f"\n[OK] Матрица ошибок сохранена в: '{fig_path}'")
+    print(f"[OK] JSON-отчёт сохранён в: '{json_path}'")
     return summary
 
 
 if __name__ == "__main__":
+    plt.switch_backend("Agg")  # Безголовый бэкенд включается только при запуске из CLI
+
     parser = argparse.ArgumentParser(description="Оценка модели на тестовой выборке DS2")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Путь к конфигурации")
     parser.add_argument("--checkpoint", type=str, default=None, help="Путь к файлу весов .pt")
+    parser.add_argument("--run-id", type=str, default=None, help="Идентификатор запуска для изоляции артефактов")
     parser.add_argument("--smoke-test", action="store_true", help="Тестовый запуск на синтетических данных")
     args = parser.parse_args()
 
-    evaluate(args.config, checkpoint_path=args.checkpoint, smoke_test=args.smoke_test)
+    evaluate(args.config, checkpoint_path=args.checkpoint, smoke_test=args.smoke_test, run_id=args.run_id)

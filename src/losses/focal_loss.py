@@ -2,10 +2,6 @@
 Сглаженный Focal Loss для несбалансированных классов ЭКГ — [ML-02]
 ===================================================================
 Ветка: feature/ml-model
-Реализует:
-1. Расчёт весов классов на основе эффективного числа сэмплов (Cui et al., CVPR 2019).
-2. Многоклассовый Focal Loss (Lin et al., ICCV 2017) для стабилизации обучения
-   и сохранения высокого Precision на редких аритмиях ('S', 'V', 'F').
 """
 
 import sys
@@ -29,23 +25,17 @@ def compute_effective_num_weights(
     """
     Вычисляет сглаженные веса классов по формуле эффективного числа сэмплов:
         w_c = (1 - beta) / (1 - beta^{N_c})
-
-    Веса нормализуются так, чтобы их сумма равнялась количеству классов K
-    (сохраняет масштаб learning rate при обучении).
-
-    Args:
-        class_counts: количество примеров каждого класса в обучающей выборке [N_0, ..., N_{K-1}]
-        beta: коэффициент сглаживания (по ТЗ: 0.999)
-
-    Returns:
-        Тензор весов формы [K] типа torch.float32
+    Безопасно обрабатывает классы с нулевым числом примеров в фолде.
     """
     counts = np.asarray(class_counts, dtype=np.float64)
-    assert np.all(counts > 0), f"Все классы в train должны иметь > 0 примеров, получено: {counts}"
+    assert np.all(counts >= 0), f"Количество примеров не может быть отрицательным: {counts}"
+    assert np.any(counts > 0), "Хотя бы один класс должен содержать > 0 примеров!"
     assert 0.0 <= beta < 1.0, f"Параметр beta должен быть в диапазоне [0, 1), получено: {beta}"
 
-    effective_num = 1.0 - np.power(beta, counts)
-    weights = (1.0 - beta) / effective_num
+    weights = np.zeros_like(counts, dtype=np.float64)
+    positive_mask = counts > 0
+    effective_num = 1.0 - np.power(beta, counts[positive_mask])
+    weights[positive_mask] = (1.0 - beta) / effective_num
 
     # Нормализация: сумма весов == K (средний вес == 1.0)
     weights = weights / np.sum(weights) * len(counts)
@@ -53,10 +43,7 @@ def compute_effective_num_weights(
 
 
 class FocalLoss(nn.Module):
-    """
-    Многоклассовый Focal Loss с поддержкой сглаженных весов alpha:
-        FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
-    """
+    """Многоклассовый Focal Loss: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)."""
 
     def __init__(
         self,
@@ -66,19 +53,13 @@ class FocalLoss(nn.Module):
     ):
         super().__init__()
         if reduction not in ("mean", "sum", "none"):
-            raise ValueError(f"Неподдерживаемый режим reduction='{reduction}'. Используйте 'mean', 'sum' или 'none'.")
+            raise ValueError(f"Неподдерживаемый режим reduction='{reduction}'.")
 
         self.register_buffer("alpha", alpha)
         self.gamma = gamma
         self.reduction = reduction
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            logits:  предсказания модели до Softmax, форма [B, C]
-            targets: истинные индексы классов, форма [B], dtype=torch.long
-        """
-        # log_pt = log(softmax(logits))[target] = -CE(logits, targets)
         ce_loss = F.cross_entropy(logits, targets, reduction="none")
         pt = torch.exp(-ce_loss)
 
@@ -97,24 +78,32 @@ class FocalLoss(nn.Module):
 
 
 if __name__ == "__main__":
-    # Проверка по критериям приёмки [ML-02] на синтетическом дисбалансе 1000 : 10 : 5 : 1
+    # 1. Проверка сглаженных весов и обработки нулевого класса
     synth_counts = [1000, 10, 5, 1]
     weights = compute_effective_num_weights(synth_counts, beta=0.999)
+    zero_safe_weights = compute_effective_num_weights([100, 0, 5, 1], beta=0.999)
+    assert zero_safe_weights[1].item() == 0.0, "Нулевой класс должен получать вес 0.0"
 
-    # Сравнение с жёсткими линейными обратными весами N / (K * N_c)
-    linear_weights = np.sum(synth_counts) / (len(synth_counts) * np.asarray(synth_counts))
-    print(f"[ML-02] Синтетический дисбаланс: {synth_counts}")
-    print(f"  Линейные обратные веса (запрещённые): {np.round(linear_weights, 2)}")
-    print(f"  Сглаженные веса (beta=0.999):         {np.round(weights.numpy(), 4)}")
+    # 2. Независимая аналитическая проверка формулы FocalLoss (gamma=2.0 vs gamma=0.0)
+    logits = torch.tensor([[2.0, 0.5, -1.0, 0.0], [0.1, 1.5, -0.5, 0.2]], requires_grad=True)
+    targets = torch.tensor([0, 1], dtype=torch.long)
 
-    # Проверка расчёта лосса и градиентов
+    probs = torch.softmax(logits.detach(), dim=1)
+    pt_manual = probs[torch.arange(2), targets]
+    ce_manual = -torch.log(pt_manual)
+    expected_focal = torch.mean(weights[targets] * ((1.0 - pt_manual) ** 2.0) * ce_manual)
+
     criterion = FocalLoss(alpha=weights, gamma=2.0)
-    logits = torch.randn(8, 4, requires_grad=True)
-    targets = torch.tensor([0, 0, 1, 2, 3, 0, 1, 2], dtype=torch.long)
+    criterion_ce = FocalLoss(alpha=weights, gamma=0.0)
 
     loss_val = criterion(logits, targets)
+    loss_ce_val = criterion_ce(logits, targets)
     loss_val.backward()
 
-    assert not torch.isnan(loss_val) and loss_val.item() > 0, "Некорректное значение лосса!"
+    assert torch.allclose(loss_val, expected_focal, atol=1e-6), (
+        f"Ошибка формулы FocalLoss: получено {loss_val.item()}, ожидалось {expected_focal.item()}"
+    )
+    assert not torch.allclose(loss_val, loss_ce_val), "Focal scaling (gamma=2.0) не изменил значение лосса!"
     assert logits.grad is not None, "Градиенты не дошли до логитов!"
-    print(f"[ML-02] Тест пройден успешно! Значение FocalLoss: {loss_val.item():.4f}")
+
+    print(f"[ML-02] Все тесты (включая аналитическую проверку) пройдены! Loss={loss_val.item():.4f}")
