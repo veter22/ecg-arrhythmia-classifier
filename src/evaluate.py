@@ -1,7 +1,7 @@
 """
-Независимая оценка модели на отложенной выборке DS2 — [ML-04]
-==============================================================
-Ветка: feature/ml-model
+Независимая оценка модели на отложенной выборке DS2 — [ML-04 v2]
+=================================================================
+Ветка: main
 """
 
 import argparse
@@ -10,7 +10,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -66,12 +66,17 @@ def predict_on_loader(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
+    class_multipliers: Optional[List[float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Возвращает истинные метки, предсказанные классы и вероятности Softmax."""
+    """Возвращает истинные метки, предсказанные классы (с учётом калибровки) и вероятности Softmax."""
     model.eval()
     all_targets = []
     all_preds = []
     all_probs = []
+
+    mult_tensor = None
+    if class_multipliers is not None:
+        mult_tensor = torch.tensor(class_multipliers, dtype=torch.float32, device=device).view(1, -1)
 
     with torch.no_grad():
         for batch in loader:
@@ -82,7 +87,8 @@ def predict_on_loader(
 
             logits = model(signals, rr)
             probs = F.softmax(logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
+            scaled_probs = probs * mult_tensor if mult_tensor is not None else probs
+            preds = torch.argmax(scaled_probs, dim=1)
 
             all_targets.append(labels.numpy())
             all_preds.append(preds.cpu().numpy())
@@ -197,14 +203,16 @@ def evaluate(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Устройство инференса: {device}")
 
-    # 1. Загрузка чекпоинта
+    # 1. Загрузка чекпоинта и калибровочных множителей
     ckpt_dir = Path(train_cfg.get("checkpoint_dir", "checkpoints"))
     base_ckpt = "smoke_best_model.pt" if smoke_test else "best_model.pt"
     default_ckpt = ckpt_dir / (f"{run_id}_{base_ckpt}" if run_id else base_ckpt)
     ckpt_file = Path(checkpoint_path) if checkpoint_path else default_ckpt
 
     model, checkpoint = load_model_from_checkpoint(ckpt_file, model_cfg, device)
+    multipliers = checkpoint.get("class_multipliers", [1.0] * NUM_CLASSES)
     print(f"[OK] Загружен чекпоинт '{ckpt_file}' (эпоха {checkpoint.get('epoch', '?')})")
+    print(f"[INFO] Калибровочные множители классов [N, S, V, F]: {multipliers}")
 
     # 2. Загрузка или генерация DS2
     if smoke_test:
@@ -217,8 +225,10 @@ def evaluate(
     test_dataset = InMemoryECGDataset(signals, rr_features, labels)
     test_loader = DataLoader(test_dataset, batch_size=256, shuffle=False)
 
-    # 3. Получение предсказаний
-    y_true, y_pred, y_probs = predict_on_loader(model, test_loader, device)
+    # 3. Получение предсказаний с учётом калибровки порогов
+    y_true, y_pred, y_probs = predict_on_loader(
+        model, test_loader, device, class_multipliers=multipliers
+    )
 
     # 4. Расчёт метрик по всем 4 классам
     all_labels = list(range(NUM_CLASSES))
@@ -269,6 +279,7 @@ def evaluate(
         "num_patients": int(len(np.unique(patient_ids))),
         "num_beats": int(len(y_true)),
         "macro_f1": round(macro_f1, 4),
+        "class_multipliers": multipliers,
         "confusion_matrix_figure": str(fig_path),
         "per_class": {
             cls_name: {
@@ -291,7 +302,7 @@ def evaluate(
 
 
 if __name__ == "__main__":
-    plt.switch_backend("Agg")  # Безголовый бэкенд включается только при запуске из CLI
+    plt.switch_backend("Agg")
 
     parser = argparse.ArgumentParser(description="Оценка модели на тестовой выборке DS2")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Путь к конфигурации")
