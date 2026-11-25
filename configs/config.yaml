@@ -3,88 +3,36 @@ project:
   seed: 42
 
 data:
-  dataset_name: "mitdb"
-  raw_dir: "data/raw"
+  raw_dir: "data/raw/mitbih"
   processed_dir: "data/processed"
-  train_file: "data/processed/ds1_train.npz"
-  test_file: "data/processed/ds2_test.npz"
+  train_file: "ds1_train.npz"
+  test_file: "ds2_test.npz"
   sampling_rate: 360
 
-  # Пациентонезависимый сплит (Inter-patient split, de Chazal et al.)
-  ds1_train_records:
-    - "101"
-    - "106"
-    - "108"
-    - "109"
-    - "112"
-    - "114"
-    - "115"
-    - "116"
-    - "118"
-    - "119"
-    - "122"
-    - "124"
-    - "201"
-    - "203"
-    - "205"
-    - "207"
-    - "208"
-    - "209"
-    - "215"
-    - "220"
-    - "223"
-    - "230"
-
-  ds2_test_records:
-    - "100"
-    - "103"
-    - "105"
-    - "111"
-    - "113"
-    - "117"
-    - "121"
-    - "123"
-    - "200"
-    - "202"
-    - "210"
-    - "212"
-    - "213"
-    - "214"
-    - "219"
-    - "221"
-    - "222"
-    - "228"
-    - "231"
-    - "232"
-    - "233"
-    - "234"
-
-  # Целевые классы по стандарту AAMI EC57
-  classes: ["N", "S", "V", "F"]
-  num_classes: 4
-
 signal_processing:
-  bandpass_low_hz: 0.5
-  bandpass_high_hz: 40.0
+  bandpass_low: 0.5
+  bandpass_high: 40.0
   filter_order: 4
-  window_before_r: 96   # отсчётов до R-пика (~0.267 с)
-  window_after_r: 160   # отсчётов после R-пика (~0.444 с) -> итого 256
-  rr_moving_avg_window: 10
-  detector_tolerance_ms: 50
+  norm_window_sec: 4.0
+  window_before_r: 96
+  window_after_r: 160
+  r_match_tolerance_ms: 50.0
 
 model:
   in_channels: 1
   signal_length: 256
-  rr_features_dim: 4
+  rr_features_dim: 6
   cnn_embed_dim: 128
   rr_embed_dim: 32
   dropout: 0.3
 
 training:
+  seed: 42
+  n_folds: 5
   batch_size: 128
-  epochs: 40
+  epochs: 35
   learning_rate: 0.001
   weight_decay: 0.0001
   focal_gamma: 2.0
-  effective_samples_beta: 0.999
+  effective_samples_beta: 0.9999
   checkpoint_dir: "checkpoints"

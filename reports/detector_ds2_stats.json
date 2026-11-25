@@ -1,0 +1,22 @@
+{
+  "ds1": {
+    "split": "ds1_train",
+    "total_reference_aami_beats": 51013,
+    "total_detected_peaks": 51128,
+    "matched_tp": 49261,
+    "unmatched_detector_fp": 1867,
+    "missed_reference_fn": 1752,
+    "detector_sensitivity": 0.9657,
+    "detector_ppv": 0.9635
+  },
+  "ds2": {
+    "split": "ds2_test",
+    "total_reference_aami_beats": 49705,
+    "total_detected_peaks": 49600,
+    "matched_tp": 49335,
+    "unmatched_detector_fp": 265,
+    "missed_reference_fn": 370,
+    "detector_sensitivity": 0.9926,
+    "detector_ppv": 0.9947
+  }
+}

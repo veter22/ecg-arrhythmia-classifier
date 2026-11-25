@@ -1,162 +1,125 @@
 """
-Гибридная архитектура нейросети: 1D ResNet + RR-MLP — [ML-01]
-=============================================================
-Ветка: feature/ml-model
-Объединяет энкодер морфологии ЭКГ-сигнала ([B, 1, 256])
-и энкодер контекста сердечного ритма ([B, 4]).
+Гибридная нейросетевая архитектура 1D-Dilated-ResNet + RR-MLP — [ML-02 v2]
 """
-
-import sys
-from pathlib import Path
-
-# Позволяет запускать файл напрямую (через Run в IDE) без ошибки импорта src
-ROOT_DIR = Path(__file__).resolve().parents[2]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 import torch
 import torch.nn as nn
 
 
-class ResidualBlock1D(nn.Module):
-    """Одномерный остаточный блок (1D ResNet) для сохранения мелких деталей формы ЭКГ."""
+class ResBlock1D(nn.Module):
+    """Остаточный 1D-блок с дилатацией для увеличения рецептивного поля без потери разрешения."""
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 5, stride: int = 1):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1, dilation: int = 1, dropout: float = 0.1):
         super().__init__()
-        padding = kernel_size // 2
-
+        padding = dilation
         self.conv1 = nn.Conv1d(
-            in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding, bias=False
+            in_channels, out_channels, kernel_size=3, stride=stride, padding=padding, dilation=dilation, bias=False
         )
         self.bn1 = nn.BatchNorm1d(out_channels)
         self.act = nn.GELU()
-
+        self.drop = nn.Dropout(dropout)
         self.conv2 = nn.Conv1d(
-            out_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding, bias=False
+            out_channels, out_channels, kernel_size=3, stride=1, padding=padding, dilation=dilation, bias=False
         )
         self.bn2 = nn.BatchNorm1d(out_channels)
 
+        self.shortcut = nn.Identity()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm1d(out_channels),
             )
-        else:
-            self.shortcut = nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = self.shortcut(x)
-
         out = self.act(self.bn1(self.conv1(x)))
+        out = self.drop(out)
         out = self.bn2(self.conv2(out))
-        out = self.act(out + residual)
-        return out
+        return self.act(out + self.shortcut(x))
 
 
 class HybridECGClassifier(nn.Module):
     """
-    Гибридный классификатор аритмий (Морфология 1D ResNet + Ритм RR-MLP).
-
-    Входы (по контракту src/contracts.py):
-        signal: [B, 1, 256] — нормализованное окно ЭКГ вокруг R-пика
-        rr:     [B, 4]      — [pre_RR, post_RR, local_RR, ratio_RR]
-
-    Выход:
-        logits: [B, 4]      — ненормализованные логиты для классов ['N', 'S', 'V', 'F']
+    Двухпоточная архитектура:
+      1) Морфологическая ветка (Dilated 1D-ResNet + 3-зонный темпоральный пулинг P / QRS / ST-T)
+      2) Ритмологическая ветка (MLP по 6 признакам вариабельности RR-интервалов)
     """
 
     def __init__(
         self,
         in_channels: int = 1,
-        rr_features_dim: int = 4,
+        signal_length: int = 256,
+        rr_features_dim: int = 6,
         cnn_embed_dim: int = 128,
         rr_embed_dim: int = 32,
         num_classes: int = 4,
         dropout: float = 0.3,
     ):
         super().__init__()
+        self.in_channels = in_channels
+        self.signal_length = signal_length
+        self.rr_features_dim = rr_features_dim
 
-        # 1. Ветка морфологии: [B, 1, 256] -> [B, cnn_embed_dim]
+        # Свёрточный ствол с расширенным рецептивным полем (~220 отсчётов / ~610 мс при 360 Гц)
         self.stem = nn.Sequential(
-            nn.Conv1d(in_channels, 32, kernel_size=7, stride=1, padding=3, bias=False),
+            nn.Conv1d(in_channels, 32, kernel_size=9, stride=2, padding=4, bias=False),
             nn.BatchNorm1d(32),
             nn.GELU(),
         )
+        self.layer1 = ResBlock1D(32, 64, stride=2, dilation=1, dropout=0.1)
+        self.layer2 = ResBlock1D(64, 128, stride=2, dilation=2, dropout=0.15)
+        self.layer3 = ResBlock1D(128, cnn_embed_dim, stride=1, dilation=4, dropout=0.15)
 
-        self.res_blocks = nn.Sequential(
-            ResidualBlock1D(32, 32, kernel_size=5, stride=1),
-            nn.MaxPool1d(kernel_size=2),  # 256 -> 128
-            ResidualBlock1D(32, 64, kernel_size=5, stride=1),
-            nn.MaxPool1d(kernel_size=2),  # 128 -> 64
-            ResidualBlock1D(64, cnn_embed_dim, kernel_size=3, stride=1),
-            nn.AdaptiveAvgPool1d(1),      # [B, cnn_embed_dim, 1]
-            nn.Flatten(),                  # [B, cnn_embed_dim]
-        )
-
-        # 2. Ветка ритма (RR-интервалы): [B, 4] -> [B, rr_embed_dim]
-        self.rhythm_encoder = nn.Sequential(
-            nn.Linear(rr_features_dim, rr_embed_dim),
-            nn.LayerNorm(rr_embed_dim),
-            nn.GELU(),
-            nn.Linear(rr_embed_dim, rr_embed_dim),
-            nn.LayerNorm(rr_embed_dim),
+        # Сохраняем порядок фаз сердечного цикла: [зона P | зона QRS | зона ST-T]
+        self.temporal_pyramid = nn.AdaptiveAvgPool1d(3)
+        self.morph_proj = nn.Sequential(
+            nn.Linear(cnn_embed_dim * 3, cnn_embed_dim),
+            nn.LayerNorm(cnn_embed_dim),
             nn.GELU(),
         )
 
-        # 3. Классифицирующая голова: [B, cnn_embed_dim + rr_embed_dim] -> [B, num_classes]
-        fusion_dim = cnn_embed_dim + rr_embed_dim
+        # Ветка RR-интервалов
+        self.rr_mlp = nn.Sequential(
+            nn.Linear(rr_features_dim, 32),
+            nn.BatchNorm1d(32),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(32, rr_embed_dim),
+            nn.BatchNorm1d(rr_embed_dim),
+            nn.GELU(),
+        )
+
+        # Классификационная голова
+        fused_dim = cnn_embed_dim + rr_embed_dim
         self.classifier = nn.Sequential(
             nn.Dropout(dropout),
-            nn.Linear(fusion_dim, 64),
+            nn.Linear(fused_dim, 96),
             nn.GELU(),
-            nn.Dropout(dropout / 2),
-            nn.Linear(64, num_classes),
+            nn.Dropout(dropout),
+            nn.Linear(96, num_classes),
         )
 
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Инициализация весов для стабильного старта обучения."""
         for m in self.modules():
-            if isinstance(m, nn.Conv1d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-            elif isinstance(m, nn.Linear):
+            if isinstance(m, (nn.Conv1d, nn.Linear)):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, signal: torch.Tensor, rr: torch.Tensor) -> torch.Tensor:
-        x_morph = self.stem(signal)
-        x_morph = self.res_blocks(x_morph)
+        x = self.stem(signal)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
 
-        x_rhythm = self.rhythm_encoder(rr)
+        # Вектор размерности (B, cnn_embed_dim * 3) с сохранением порядка сегментов
+        x_pyr = self.temporal_pyramid(x).flatten(1)
+        morph_emb = self.morph_proj(x_pyr)
 
-        fused = torch.cat([x_morph, x_rhythm], dim=1)
-        logits = self.classifier(fused)
-        return logits
-
-
-if __name__ == "__main__":
-    # Smoke-тест по критериям приёмки [ML-01]
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = HybridECGClassifier().to(device)
-
-    batch_size = 16
-    dummy_signal = torch.randn(batch_size, 1, 256, device=device)
-    dummy_rr = torch.randn(batch_size, 4, device=device)
-    dummy_targets = torch.randint(0, 4, (batch_size,), device=device)
-
-    # 1. Прямой проход (forward)
-    logits = model(dummy_signal, dummy_rr)
-    assert logits.shape == (batch_size, 4), f"Ожидалась форма {(batch_size, 4)}, получена {logits.shape}"
-
-    # 2. Обратное распространение ошибки (backward)
-    loss = nn.CrossEntropyLoss()(logits, dummy_targets)
-    loss.backward()
-
-    has_grads = all(p.grad is not None for p in model.parameters() if p.requires_grad)
-    assert has_grads, "Не все обучаемые параметры получили градиенты!"
-
-    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"[ML-01] Smoke-тест пройден успешно на устройстве: {device}")
-    print(f"Форма выхода: {logits.shape} | Обучаемых параметров: {total_params:,}")
+        rr_emb = self.rr_mlp(rr)
+        fused = torch.cat([morph_emb, rr_emb], dim=1)
+        return self.classifier(fused)

@@ -1,45 +1,241 @@
 {
   "run_id": "default",
-  "checkpoint": "checkpoints\\best_model.pt",
+  "checkpoint": "checkpoints/best_model.pt",
   "split": "ds2_test",
   "num_patients": 22,
-  "num_beats": 49319,
-  "macro_f1": 0.5541,
-  "class_multipliers": [
+  "num_beats": 49291,
+  "raw_macro_f1": 0.4825,
+  "macro_f1": 0.4853,
+  "macro_f1_nsv": 0.6383,
+  "decision_weights": [
     1.0,
-    1.5,
-    1.0,
-    1.1
+    1.0971,
+    0.9466,
+    0.7193
   ],
-  "confusion_matrix_figure": "reports\\figures\\confusion_matrix.png",
+  "confusion_matrix_figure": "reports/figures/confusion_matrix.png",
   "per_class": {
     "N": {
-      "precision": 0.9503,
-      "recall": 0.9852,
-      "f1": 0.9674,
-      "pr_auc": 0.9928,
-      "support": 44125
+      "precision": 0.965,
+      "recall": 0.9178,
+      "f1": 0.9408,
+      "pr_auc": 0.9833,
+      "support": 44071
     },
     "S": {
-      "precision": 0.5979,
-      "recall": 0.313,
-      "f1": 0.4109,
-      "pr_auc": 0.4125,
-      "support": 1824
+      "precision": 0.2811,
+      "recall": 0.1667,
+      "f1": 0.2093,
+      "pr_auc": 0.2037,
+      "support": 1818
     },
     "V": {
-      "precision": 0.9101,
-      "recall": 0.7694,
-      "f1": 0.8339,
-      "pr_auc": 0.9037,
-      "support": 2988
+      "precision": 0.6441,
+      "recall": 0.941,
+      "f1": 0.7647,
+      "pr_auc": 0.9445,
+      "support": 3017
     },
     "F": {
-      "precision": 0.0108,
-      "recall": 0.0026,
-      "f1": 0.0042,
-      "pr_auc": 0.007,
-      "support": 382
+      "precision": 0.0159,
+      "recall": 0.0779,
+      "f1": 0.0264,
+      "pr_auc": 0.013,
+      "support": 385
+    }
+  },
+  "per_patient": {
+    "100": {
+      "num_beats": 2271,
+      "present_classes": [
+        "N",
+        "S",
+        "V"
+      ],
+      "patient_macro_f1": 1.0
+    },
+    "103": {
+      "num_beats": 2082,
+      "present_classes": [
+        "N",
+        "S"
+      ],
+      "patient_macro_f1": 0.8332
+    },
+    "105": {
+      "num_beats": 2538,
+      "present_classes": [
+        "N",
+        "V"
+      ],
+      "patient_macro_f1": 0.687
+    },
+    "111": {
+      "num_beats": 2115,
+      "present_classes": [
+        "N",
+        "V"
+      ],
+      "patient_macro_f1": 0.4912
+    },
+    "113": {
+      "num_beats": 1793,
+      "present_classes": [
+        "N",
+        "S"
+      ],
+      "patient_macro_f1": 0.8148
+    },
+    "117": {
+      "num_beats": 1530,
+      "present_classes": [
+        "N",
+        "S"
+      ],
+      "patient_macro_f1": 0.9737
+    },
+    "121": {
+      "num_beats": 1856,
+      "present_classes": [
+        "N",
+        "S",
+        "V"
+      ],
+      "patient_macro_f1": 0.6666
+    },
+    "123": {
+      "num_beats": 1513,
+      "present_classes": [
+        "N"
+      ],
+      "patient_macro_f1": 1.0
+    },
+    "200": {
+      "num_beats": 2586,
+      "present_classes": [
+        "N",
+        "S",
+        "V",
+        "F"
+      ],
+      "patient_macro_f1": 0.659
+    },
+    "202": {
+      "num_beats": 2128,
+      "present_classes": [
+        "N",
+        "S",
+        "V",
+        "F"
+      ],
+      "patient_macro_f1": 0.6056
+    },
+    "210": {
+      "num_beats": 2609,
+      "present_classes": [
+        "N",
+        "S",
+        "V",
+        "F"
+      ],
+      "patient_macro_f1": 0.4798
+    },
+    "212": {
+      "num_beats": 2746,
+      "present_classes": [
+        "N"
+      ],
+      "patient_macro_f1": 1.0
+    },
+    "213": {
+      "num_beats": 3223,
+      "present_classes": [
+        "N",
+        "S",
+        "V",
+        "F"
+      ],
+      "patient_macro_f1": 0.448
+    },
+    "214": {
+      "num_beats": 2245,
+      "present_classes": [
+        "N",
+        "V",
+        "F"
+      ],
+      "patient_macro_f1": 0.3894
+    },
+    "219": {
+      "num_beats": 2148,
+      "present_classes": [
+        "N",
+        "S",
+        "V",
+        "F"
+      ],
+      "patient_macro_f1": 0.3461
+    },
+    "221": {
+      "num_beats": 2418,
+      "present_classes": [
+        "N",
+        "V"
+      ],
+      "patient_macro_f1": 0.9988
+    },
+    "222": {
+      "num_beats": 2426,
+      "present_classes": [
+        "N",
+        "S"
+      ],
+      "patient_macro_f1": 0.7838
+    },
+    "228": {
+      "num_beats": 1907,
+      "present_classes": [
+        "N",
+        "S",
+        "V"
+      ],
+      "patient_macro_f1": 0.7274
+    },
+    "231": {
+      "num_beats": 1568,
+      "present_classes": [
+        "N",
+        "S",
+        "V"
+      ],
+      "patient_macro_f1": 0.3279
+    },
+    "232": {
+      "num_beats": 1767,
+      "present_classes": [
+        "N",
+        "S"
+      ],
+      "patient_macro_f1": 0.1919
+    },
+    "233": {
+      "num_beats": 3072,
+      "present_classes": [
+        "N",
+        "S",
+        "V",
+        "F"
+      ],
+      "patient_macro_f1": 0.4304
+    },
+    "234": {
+      "num_beats": 2750,
+      "present_classes": [
+        "N",
+        "S",
+        "V"
+      ],
+      "patient_macro_f1": 0.7132
     }
   }
 }

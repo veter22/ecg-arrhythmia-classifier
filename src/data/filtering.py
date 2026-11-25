@@ -1,373 +1,248 @@
 """
-Модуль предобработки ЭКГ-сигнала и детекции R-пиков — [DATA-02]
-================================================================
-Ветка: feature/data-pipeline
-Файл: src/data/filtering.py
-
-Реализует:
-1. Полосовой фильтр Баттерворта (0.5–40 Гц, 4-й порядок) + Z-нормализацию.
-2. Автономный детектор R-пиков по алгоритму Пана — Томпкинса (без опоры на wfdb.rdann).
-3. Валидацию детектора относительно эталонной разметки с допуском ±50 мс.
+Фильтрация сигнала ЭКГ, детектор R-пиков Пана — Томпкинса и оценка детекции.
 """
 
+import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks
-import yaml
-
-from src.contracts import AAMI_MAPPING
-
-# Все символы MIT-BIH, обозначающие реальные сокращения сердца (включая класс Q: '/', 'f', 'Q'),
-# чтобы при оценке детектора R-пиков не штрафовать его за обнаружение кардиостимулированных/сливных ударов.
-ALL_BEAT_SYMBOLS = set(AAMI_MAPPING.keys()) | {"/", "f", "Q"}
-
-
-def bandpass_filter(
-    signal: np.ndarray,
-    fs: float = 360.0,
-    lowcut: float = 0.5,
-    highcut: float = 40.0,
-    order: int = 4,
-) -> np.ndarray:
-    """
-    Полосовой фильтр Баттерворта (нулевая фаза через filtfilt) для подавления
-    дрейфа изолинии (<0.5 Гц) и сетевых помех (50/60 Гц).
-    """
-    sig = np.asarray(signal, dtype=np.float64)
-    nyq = 0.5 * fs
-    b, a = butter(order, [lowcut / nyq, highcut / nyq], btype="band")
-    return filtfilt(b, a, sig)
-
-
-def z_normalize(signal: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Z-нормализация сигнала (mean=0, std=1)."""
-    mean = np.mean(signal)
-    std = np.std(signal)
-    return (signal - mean) / (std + eps)
 
 
 def preprocess_ecg(
     raw_signal: np.ndarray,
-    fs: float = 360.0,
+    fs: int = 360,
     lowcut: float = 0.5,
     highcut: float = 40.0,
     order: int = 4,
-) -> np.ndarray:
-    """Полная предобработка канала ЭКГ: полосовая фильтрация 0.5–40 Гц + Z-нормализация."""
-    filtered = bandpass_filter(raw_signal, fs=fs, lowcut=lowcut, highcut=highcut, order=order)
-    return z_normalize(filtered)
-
-
-def pan_tompkins_detector(
-    signal: np.ndarray,
-    fs: float = 360.0,
-    is_preprocessed: bool = False,
-    lowcut: float = 0.5,
-    highcut: float = 40.0,
-    filter_order: int = 4,
+    norm_window_sec: float = 4.0,
 ) -> np.ndarray:
     """
-    Автономный детектор R-пиков по алгоритму Пана — Томпкинса.
-
-    Этапы:
-    1. Полосовой фильтр 5–15 Гц для выделения энергии QRS-комплекса.
-    2. 5-точечное дифференцирование для выделения крутизны фронтов QRS.
-    3. Возведение в квадрат (нелинейное усиление).
-    4. Скользящее оконное интегрирование (окно 150 мс).
-    5. Адаптивная двухпороговая логика (SPKI / NPKI) с рефрактерным периодом 200 мс
-       и механизмом search-back при пропуске удара (> 1.66 * RR_avg).
-    6. Уточнение координаты вершины R-зубца на очищенном сигнале (0.5–40 Гц).
-
-    Args:
-        signal: Одномерный массив отсчётов ЭКГ.
-        fs: Частота дискретизации (Гц).
-        is_preprocessed: Передан ли уже отфильтрованный и нормализованный сигнал.
-
-    Returns:
-        Отсортированный 1D-массив индексов R-пиков (dtype=np.int64).
+    Полосовая фильтрация Баттерворта и локальная робастная Z-нормализация
+    (скользящее окно 4 с), устойчивая к единичным крупным артефактам.
     """
-    sig = np.asarray(signal, dtype=np.float64)
-    base_signal = (
-        sig
-        if is_preprocessed
-        else preprocess_ecg(sig, fs=fs, lowcut=lowcut, highcut=highcut, order=filter_order)
-    )
-
-    # 1. Фильтрация полосы QRS (5–15 Гц)
     nyq = 0.5 * fs
-    b_qrs, a_qrs = butter(2, [5.0 / nyq, 15.0 / nyq], btype="band")
-    qrs_filtered = filtfilt(b_qrs, a_qrs, base_signal)
+    b, a = butter(order, [lowcut / nyq, highcut / nyq], btype="band")
+    filtered = filtfilt(b, a, raw_signal.astype(np.float64))
 
-    # 2. Производная Пана — Томпкинса
-    diff_kernel = np.array([-1.0, -2.0, 0.0, 2.0, 1.0]) * (fs / 8.0)
-    differentiated = np.convolve(qrs_filtered, diff_kernel, mode="same")
+    win = max(int(norm_window_sec * fs), fs)
+    half_w = win // 2
+    n = len(filtered)
+    normed = np.empty_like(filtered, dtype=np.float32)
 
-    # 3. Возведение в квадрат
-    squared = differentiated ** 2
+    # Блочная оценка медианного масштаба (MAD -> std) для защиты от выбросов
+    step = max(win // 2, 1)
+    centers = list(range(0, n, step))
+    local_means = np.empty(len(centers), dtype=np.float64)
+    local_scales = np.empty(len(centers), dtype=np.float64)
 
-    # 4. Скользящее оконное интегрирование (150 мс)
-    win_size = max(1, int(round(0.150 * fs)))
-    integrated = np.convolve(squared, np.ones(win_size) / win_size, mode="same")
+    for idx, c in enumerate(centers):
+        seg = filtered[max(0, c - half_w) : min(n, c + half_w)]
+        med = np.median(seg)
+        mad = np.median(np.abs(seg - med))
+        robust_std = 1.4826 * mad if mad > 1e-6 else float(np.std(seg))
+        local_means[idx] = med
+        local_scales[idx] = max(robust_std, 1e-4)
 
-    # 5. Поиск кандидатов с рефрактерным периодом 200 мс
-    refractory_samples = int(round(0.200 * fs))
-    candidate_peaks, _ = find_peaks(integrated, distance=refractory_samples)
+    sample_idx = np.arange(n, dtype=np.float64)
+    center_arr = np.asarray(centers, dtype=np.float64)
+    interp_mean = np.interp(sample_idx, center_arr, local_means)
+    interp_scale = np.interp(sample_idx, center_arr, local_scales)
 
-    if len(candidate_peaks) == 0:
+    normed[:] = np.clip((filtered - interp_mean) / interp_scale, -15.0, 15.0).astype(np.float32)
+    return normed
+
+
+def _refine_peak(
+    filtered_signal: np.ndarray,
+    approx_idx: int,
+    fs: int = 360,
+    search_ms: float = 40.0,
+    dominant_sign: float = 1.0,
+) -> int:
+    """
+    Уточняет позицию R-пика в узком окне ±40 мс с учётом доминирующей полярности R-зубца,
+    чтобы центр окна не съезжал на глубокий Q или S зубец.
+    """
+    radius = max(int(round(search_ms * fs / 1000.0)), 1)
+    start = max(0, approx_idx - radius)
+    end = min(len(filtered_signal), approx_idx + radius + 1)
+    segment = filtered_signal[start:end]
+    if len(segment) == 0:
+        return approx_idx
+
+    oriented = segment * dominant_sign
+    if np.max(oriented) > 0.35 * np.max(np.abs(segment)):
+        return start + int(np.argmax(oriented))
+    return start + int(np.argmax(np.abs(segment)))
+
+
+def pan_tompkins_detector(ecg_signal: np.ndarray, fs: int = 360) -> np.ndarray:
+    """
+    Адаптивный детектор R-пиков Пана — Томпкинса:
+    - корректная ориентированная производная
+    - робастная инициализация порогов spki/npki
+    - проверка крутизны фронта против высоких T-зубцов
+    - корректный search-back с проверкой рефрактерного периода 200 мс.
+    """
+    n = len(ecg_signal)
+    if n < fs:
         return np.array([], dtype=np.int64)
 
-    # Инициализация порогов по первым 2 секундам
-    init_len = min(len(integrated), int(2.0 * fs))
-    spki = 0.25 * float(np.max(integrated[:init_len]))
-    npki = 0.50 * float(np.mean(integrated[:init_len]))
+    # Полосовая фильтрация QRS (5–15 Гц) для детекции
+    nyq = 0.5 * fs
+    b_qrs, a_qrs = butter(2, [5.0 / nyq, 15.0 / nyq], btype="band")
+    qrs_filt = filtfilt(b_qrs, a_qrs, ecg_signal.astype(np.float64))
+
+    # Производная: y[n] = (2x[n] + x[n-1] - x[n-3] - 2x[n-4]) / 8
+    # В np.convolve ядро переворачивается, поэтому задаём его в обратном порядке
+    deriv_kernel = np.array([1.0, 2.0, 0.0, -2.0, -1.0], dtype=np.float64) / 8.0
+    diff_sig = np.convolve(qrs_filt, deriv_kernel, mode="same")
+    squared_sig = diff_sig ** 2
+
+    mwi_win = max(int(round(0.150 * fs)), 1)
+    mwi_sig = np.convolve(squared_sig, np.ones(mwi_win, dtype=np.float64) / mwi_win, mode="same")
+
+    # Определяем доминирующую полярность R-зубца по 95-му и 5-му перцентилям
+    p95 = float(np.percentile(ecg_signal, 95))
+    p05 = float(np.percentile(ecg_signal, 5))
+    dominant_sign = 1.0 if abs(p95) >= abs(p05) else -1.0
+
+    # Робастная инициализация порогов по первым 4 секундам (разбитым на 1-сек окна)
+    init_sec = min(4, n // fs)
+    sec_maxima = [float(np.max(mwi_sig[s * fs : (s + 1) * fs])) for s in range(init_sec)]
+    robust_init_peak = float(np.median(sec_maxima)) if sec_maxima else float(np.percentile(mwi_sig, 95))
+    spki = 0.5 * robust_init_peak
+    npki = 0.1 * robust_init_peak
     threshold_i1 = npki + 0.25 * (spki - npki)
     threshold_i2 = 0.5 * threshold_i1
 
+    refractory = int(round(0.200 * fs))
+    twave_limit = int(round(0.360 * fs))
+    min_dist = int(round(0.150 * fs))
+
+    candidate_peaks, _ = find_peaks(mwi_sig, distance=min_dist)
     detected_peaks: List[int] = []
     rr_history: List[int] = []
-    refine_radius = int(round(0.075 * fs))  # ±75 мс для точной привязки к вершине R-пика
+    last_qrs_slope: float = float(np.percentile(np.abs(diff_sig), 95))
 
-    def _refine_peak(approx_idx: int) -> int:
-        left = max(0, approx_idx - refine_radius)
-        right = min(len(base_signal), approx_idx + refine_radius + 1)
-        # Используем abs(), чтобы корректно центрировать и инвертированные V-экстрасистолы
-        return left + int(np.argmax(np.abs(base_signal[left:right])))
+    def _slope_at(idx: int) -> float:
+        s = max(0, idx - mwi_win // 2)
+        e = min(n, idx + mwi_win // 2 + 1)
+        return float(np.max(np.abs(diff_sig[s:e]))) if e > s else 0.0
 
-    for pk in candidate_peaks:
-        pk_val = float(integrated[pk])
+    for i, pk in enumerate(candidate_peaks):
+        peaki = float(mwi_sig[pk])
+        cur_slope = _slope_at(pk)
 
-        # Search-back: проверка на пропущенный удар при длинной паузе
-        if len(detected_peaks) >= 2 and len(rr_history) >= 2:
-            rr_avg = float(np.mean(rr_history[-8:]))
-            last_pk = detected_peaks[-1]
-            if (pk - last_pk) > 1.66 * rr_avg:
-                sb_start = last_pk + refractory_samples
-                sb_end = pk - refractory_samples
-                if sb_end > sb_start:
-                    sb_segment = integrated[sb_start:sb_end]
-                    sb_rel = int(np.argmax(sb_segment))
-                    sb_val = float(sb_segment[sb_rel])
-                    if sb_val > threshold_i2:
-                        refined_sb = _refine_peak(sb_start + sb_rel)
-                        if (refined_sb - detected_peaks[-1]) >= refractory_samples:
+        # 1. Сначала проверяем текущего кандидата pk
+        is_qrs = False
+        if peaki >= threshold_i1:
+            if not detected_peaks:
+                is_qrs = True
+            else:
+                dist_from_last = pk - detected_peaks[-1]
+                if dist_from_last < refractory:
+                    is_qrs = False
+                elif dist_from_last <= twave_limit and cur_slope < 0.5 * last_qrs_slope:
+                    # Отсеиваем высокий зубец T по пологому фронту
+                    is_qrs = False
+                else:
+                    is_qrs = True
+
+        # 2. Search-back при длинной паузе (> 1.66 * среднего RR)
+        rr_avg = float(np.mean(rr_history[-8:])) if rr_history else float(0.8 * fs)
+        search_limit = int(round(1.66 * rr_avg))
+        anchor_prev = detected_peaks[-1] if detected_peaks else 0
+
+        if (pk - anchor_prev) > search_limit:
+            sb_start = anchor_prev + refractory
+            sb_end = pk - refractory if is_qrs else pk
+            if sb_end > sb_start:
+                # Перебираем все кандидаты внутри пропущенного окна
+                in_window = [
+                    c for c in candidate_peaks
+                    if sb_start <= c < sb_end and float(mwi_sig[c]) >= threshold_i2
+                ]
+                if in_window:
+                    best_sb = max(in_window, key=lambda c: float(mwi_sig[c]))
+                    refined_sb = _refine_peak(ecg_signal, int(best_sb), fs=fs, dominant_sign=dominant_sign)
+                    # Проверяем рефрактерный период после уточнения с обеих сторон
+                    ok_left = (not detected_peaks) or (refined_sb - detected_peaks[-1] >= refractory)
+                    ok_right = (not is_qrs) or (pk - refined_sb >= refractory)
+                    if ok_left and ok_right:
+                        if detected_peaks:
                             rr_history.append(refined_sb - detected_peaks[-1])
-                            detected_peaks.append(refined_sb)
-                            spki = 0.25 * sb_val + 0.75 * spki
-                            threshold_i1 = npki + 0.25 * (spki - npki)
-                            threshold_i2 = 0.5 * threshold_i1
+                        detected_peaks.append(refined_sb)
+                        sb_val = float(mwi_sig[best_sb])
+                        spki = 0.25 * sb_val + 0.75 * spki
+                        last_qrs_slope = 0.25 * _slope_at(best_sb) + 0.75 * last_qrs_slope
+                        threshold_i1 = npki + 0.25 * (spki - npki)
+                        threshold_i2 = 0.5 * threshold_i1
 
-        # Классификация кандидата как R-пик или шум
-        if pk_val >= threshold_i1:
-            refined_pk = _refine_peak(int(pk))
-            if not detected_peaks or (refined_pk - detected_peaks[-1]) >= refractory_samples:
+        # 3. Фиксируем текущего кандидата pk (как QRS или как шум)
+        if is_qrs:
+            refined_pk = _refine_peak(ecg_signal, int(pk), fs=fs, dominant_sign=dominant_sign)
+            if not detected_peaks or (refined_pk - detected_peaks[-1] >= refractory):
                 if detected_peaks:
                     rr_history.append(refined_pk - detected_peaks[-1])
                 detected_peaks.append(refined_pk)
-                spki = 0.125 * pk_val + 0.875 * spki
+                spki = 0.125 * peaki + 0.875 * spki
+                last_qrs_slope = 0.125 * cur_slope + 0.875 * last_qrs_slope
             else:
-                npki = 0.125 * pk_val + 0.875 * npki
+                npki = 0.125 * peaki + 0.875 * npki
         else:
-            npki = 0.125 * pk_val + 0.875 * npki
+            npki = 0.125 * peaki + 0.875 * npki
+            # Мягкая релаксация spki при длительном отсутствии детекций
+            if detected_peaks and (pk - detected_peaks[-1]) > int(2.5 * fs):
+                spki = max(0.85 * spki, 2.0 * npki)
 
         threshold_i1 = npki + 0.25 * (spki - npki)
         threshold_i2 = 0.5 * threshold_i1
 
-    return np.array(detected_peaks, dtype=np.int64)
+    return np.asarray(detected_peaks, dtype=np.int64)
 
 
 def evaluate_r_peak_detector(
     detected_peaks: np.ndarray,
     reference_peaks: np.ndarray,
-    fs: float = 360.0,
+    fs: int = 360,
     tolerance_ms: float = 50.0,
 ) -> Dict[str, float]:
     """
-    Валидирует детектор R-пиков относительно эталонной разметки wfdb.rdann
-    с допуском ±tolerance_ms (по config.yaml: 50 мс = 18 отсчётов при 360 Гц).
-
-    Сопоставление выполняется строго 1-к-1 по ближайшему эталонному пику.
+    Сопоставление 1-к-1 между найденными пиками и эталонной разметкой:
+    для каждого найденного пика ищется ближайший ещё не занятый эталон в пределах ±tolerance_ms.
     """
-    det = np.sort(np.asarray(detected_peaks, dtype=np.int64))
-    ref = np.sort(np.asarray(reference_peaks, dtype=np.int64))
-    tol_samples = int(round((tolerance_ms / 1000.0) * fs))
-
-    if len(ref) == 0 and len(det) == 0:
-        return {"TP": 0, "FP": 0, "FN": 0, "Precision": 1.0, "Recall": 1.0, "F1": 1.0, "MAE_ms": 0.0}
-    if len(ref) == 0:
-        return {"TP": 0, "FP": len(det), "FN": 0, "Precision": 0.0, "Recall": 0.0, "F1": 0.0, "MAE_ms": 0.0}
-    if len(det) == 0:
-        return {"TP": 0, "FP": 0, "FN": len(ref), "Precision": 0.0, "Recall": 0.0, "F1": 0.0, "MAE_ms": 0.0}
-
-    matched_ref = np.zeros(len(ref), dtype=bool)
+    tol_samples = int(round(tolerance_ms * fs / 1000.0))
+    matched_ref = np.zeros(len(reference_peaks), dtype=bool)
     tp = 0
-    abs_errors: List[int] = []
 
-    for d in det:
-        diffs = np.abs(ref - d)
-        min_idx = int(np.argmin(diffs))
-        if diffs[min_idx] <= tol_samples and not matched_ref[min_idx]:
-            matched_ref[min_idx] = True
+    for det in detected_peaks:
+        free_indices = np.where(~matched_ref)[0]
+        if len(free_indices) == 0:
+            break
+        diffs = np.abs(reference_peaks[free_indices] - det)
+        best_local = int(np.argmin(diffs))
+        if diffs[best_local] <= tol_samples:
+            matched_ref[free_indices[best_local]] = True
             tp += 1
-            abs_errors.append(int(diffs[min_idx]))
 
-    fp = len(det) - tp
-    fn = len(ref) - tp
-
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-    mae_ms = (float(np.mean(abs_errors)) / fs) * 1000.0 if abs_errors else 0.0
+    fp = int(len(detected_peaks) - tp)
+    fn = int(len(reference_peaks) - tp)
+    se = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    ppv = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    f1 = 2 * se * ppv / (se + ppv) if (se + ppv) > 0 else 0.0
 
     return {
         "TP": tp,
         "FP": fp,
         "FN": fn,
-        "Precision": round(precision, 5),
-        "Recall": round(recall, 5),
-        "F1": round(f1, 5),
-        "MAE_ms": round(mae_ms, 2),
+        "Sensitivity": round(se, 4),
+        "PPV": round(ppv, 4),
+        "F1": round(f1, 4),
     }
-
-
-def validate_records(
-    records: List[str],
-    raw_dir: str = "data/raw",
-    fs: float = 360.0,
-    lowcut: float = 0.5,
-    highcut: float = 40.0,
-    filter_order: int = 4,
-    tolerance_ms: float = 50.0,
-) -> Tuple[Dict[str, Dict[str, float]], Dict[str, float]]:
-    """
-    Запускает фильтрацию, детекцию и расчёт метрик для списка записей MIT-BIH.
-    """
-    import wfdb
-
-    per_record: Dict[str, Dict[str, float]] = {}
-    total_tp, total_fp, total_fn = 0, 0, 0
-
-    for rec_id in records:
-        rec_path = str(Path(raw_dir) / rec_id)
-        record = wfdb.rdrecord(rec_path)
-        ann = wfdb.rdann(rec_path, "atr")
-
-        # Выбираем стандартное отведение MLII, если доступно, иначе канал 0
-        ch_idx = record.sig_name.index("MLII") if "MLII" in record.sig_name else 0
-        raw_signal = record.p_signal[:, ch_idx]
-        rec_fs = float(record.fs) if record.fs else fs
-
-        ref_peaks = np.array(
-            [s for s, sym in zip(ann.sample, ann.symbol) if sym in ALL_BEAT_SYMBOLS],
-            dtype=np.int64,
-        )
-
-        clean_signal = preprocess_ecg(
-            raw_signal, fs=rec_fs, lowcut=lowcut, highcut=highcut, order=filter_order
-        )
-        det_peaks = pan_tompkins_detector(clean_signal, fs=rec_fs, is_preprocessed=True)
-        metrics = evaluate_r_peak_detector(det_peaks, ref_peaks, fs=rec_fs, tolerance_ms=tolerance_ms)
-
-        per_record[rec_id] = metrics
-        total_tp += metrics["TP"]
-        total_fp += metrics["FP"]
-        total_fn += metrics["FN"]
-
-    overall_p = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-    overall_r = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-    overall_f1 = (2 * overall_p * overall_r) / (overall_p + overall_r) if (overall_p + overall_r) > 0 else 0.0
-
-    summary = {
-        "TP": total_tp,
-        "FP": total_fp,
-        "FN": total_fn,
-        "Precision": round(overall_p, 5),
-        "Recall": round(overall_r, 5),
-        "F1": round(overall_f1, 5),
-    }
-    return per_record, summary
-
-
-def plot_detection_check(
-    record_id: str,
-    raw_dir: str = "data/raw",
-    start_sec: float = 0.0,
-    duration_sec: float = 10.0,
-    save_path: Optional[str] = None,
-) -> None:
-    """
-    Визуализация для проверки Definition of Done:
-    отображает исходный и отфильтрованный сигнал с маркерами найденных R-пиков и эталона.
-    """
-    import matplotlib.pyplot as plt
-    import wfdb
-
-    rec_path = str(Path(raw_dir) / record_id)
-    record = wfdb.rdrecord(rec_path)
-    ann = wfdb.rdann(rec_path, "atr")
-
-    ch_idx = record.sig_name.index("MLII") if "MLII" in record.sig_name else 0
-    raw_sig = record.p_signal[:, ch_idx]
-    fs = float(record.fs)
-
-    clean_sig = preprocess_ecg(raw_sig, fs=fs)
-    det_peaks = pan_tompkins_detector(clean_sig, fs=fs, is_preprocessed=True)
-    ref_peaks = np.array([s for s, sym in zip(ann.sample, ann.symbol) if sym in ALL_BEAT_SYMBOLS])
-
-    s_idx = int(start_sec * fs)
-    e_idx = int((start_sec + duration_sec) * fs)
-    t = np.arange(s_idx, e_idx) / fs
-
-    det_seg = det_peaks[(det_peaks >= s_idx) & (det_peaks < e_idx)]
-    ref_seg = ref_peaks[(ref_peaks >= s_idx) & (ref_peaks < e_idx)]
-
-    fig, axes = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
-    axes[0].plot(t, raw_sig[s_idx:e_idx], color="gray", linewidth=1.0, label="Raw ECG (MLII)")
-    axes[0].set_title(f"Record {record_id}: Исходный сигнал vs Фильтрация 0.5–40 Гц и детекция R-пиков")
-    axes[0].set_ylabel("Amplitude (mV)")
-    axes[0].legend(loc="upper right")
-    axes[0].grid(alpha=0.3)
-
-    axes[1].plot(t, clean_sig[s_idx:e_idx], color="#1f77b4", linewidth=1.1, label="Filtered + Z-norm")
-    axes[1].scatter(
-        ref_seg / fs, clean_sig[ref_seg], marker="o", s=70, facecolors="none", edgecolors="green", linewidths=1.5, label="Reference (wfdb)"
-    )
-    axes[1].scatter(
-        det_seg / fs, clean_sig[det_seg], marker="x", s=60, color="red", linewidths=1.5, label="Pan-Tompkins R-peaks"
-    )
-    axes[1].set_xlabel("Time (s)")
-    axes[1].set_ylabel("Z-score")
-    axes[1].legend(loc="upper right")
-    axes[1].grid(alpha=0.3)
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150)
-    else:
-        plt.show()
-
-
-if __name__ == "__main__":
-    with open("configs/config.yaml", "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    data_cfg = cfg["data"]
-    sp_cfg = cfg["signal_processing"]
-
-    # Проверяем на первых 3 записях из ds2_test_records (при условии, что данные уже скачаны в data/raw)
-    sample_records = data_cfg["ds2_test_records"][:3]
-    print(f"[DATA-02] Валидация детектора Пана — Томпкинса на записях: {sample_records}")
-
-    per_rec, summary = validate_records(
-        records=sample_records,
-        raw_dir=data_cfg["raw_dir"],
-        fs=data_cfg["sampling_rate"],
-        lowcut=sp_cfg["bandpass_low_hz"],
-        highcut=sp_cfg["bandpass_high_hz"],
-        filter_order=sp_cfg["filter_order"],
-        tolerance_ms=sp_cfg["detector_tolerance_ms"],
-    )
-
-    for rec, m in per_rec.items():
-        print(f"  Record {rec}: Precision={m['Precision']:.4f}, Recall={m['Recall']:.4f}, MAE={m['MAE_ms']} ms")
-    print(f"[DATA-02] Summary: {summary}")
